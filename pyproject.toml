@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "t-darts-fb"
+version = "0.1.0"
+description = "Temporal DARTS on top of a frozen FBNAS baseline"
+readme = "README.md"
+requires-python = ">=3.9"
+
+# PyYAML is needed only to read configs/servers.yaml.  configs/servers.json is
+# a generated mirror of the same content, so the profile interface still works
+# if PyYAML is missing; see tools/sync_servers_config.py.
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+# Inspect which server profile is active: `t-darts-profile --list`
+t-darts-profile = "tdarts.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tdarts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

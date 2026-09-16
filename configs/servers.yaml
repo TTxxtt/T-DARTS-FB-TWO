@@ -1,0 +1,75 @@
+# Machine profiles for T-DARTS-FB.
+#
+# This file is the single place that knows where things live.  Training code
+# never hard-codes a path; it asks for a profile:
+#
+#     from tdarts.config import get_profile
+#     prof = get_profile()                 # auto-detect
+#     prof = get_profile("serverA")        # explicit
+#
+# Selection precedence:
+#   1. explicit name passed to get_profile()
+#   2. $T_DARTS_PROFILE
+#   3. the `auto` hostname rules below
+#   4. `default_profile`
+#
+# Values may use ${VARS} and ~, expanded when the profile is loaded.
+# Per-machine environment overrides, useful for one-off runs:
+#   T_DARTS_DATA_ROOT, T_DARTS_OUTPUT_ROOT, T_DARTS_CONDA_ENV
+#   T_DARTS__serverA__DATA_ROOT   (scoped to one profile)
+#
+# configs/servers.json is a generated mirror of this file, so that the profile
+# interface still works on machines without PyYAML.  Edit THIS file, then run:
+#   python tools/sync_servers_config.py
+
+_generated_from: configs/servers.yaml
+
+default_profile: local
+
+profiles:
+
+  # ------------------------------------------------------------------
+  # The Windows laptop.  Paths verified on this machine.
+  # ------------------------------------------------------------------
+  local:
+    kind: local
+    host: DESKTOP-JNLTK3I
+    auto: ["DESKTOP-JNLTK3I"]
+    data_root: D:/code/T-DARTS-FB/data
+    output_root: D:/code/T-DARTS-FB/outputs
+    upstream_root: D:/code/T-DARTS-FB/FBNAS
+    conda_env: null
+    python: python
+
+  # ------------------------------------------------------------------
+  # GPU server A.  FILL IN the three paths before first use.
+  # `kind: remote` requires POSIX absolute paths; a Windows path here is
+  # rejected at load time on purpose.
+  # ------------------------------------------------------------------
+  serverA:
+    kind: remote
+    host: null
+    auto: null
+    data_root: /gpfs/REPLACE_ME/datasets
+    output_root: /gpfs/REPLACE_ME/outputs
+    upstream_root: /gpfs/REPLACE_ME/code/FBNAS
+    conda_env: eeg
+    python: python
+    # Anything else you want to keep with the machine:
+    scheduler: slurm
+    gpu: "0"
+
+  # ------------------------------------------------------------------
+  # GPU server B.  FILL IN.
+  # ------------------------------------------------------------------
+  serverB:
+    kind: remote
+    host: null
+    auto: null
+    data_root: /home/REPLACE_ME/data
+    output_root: /home/REPLACE_ME/outputs
+    upstream_root: /home/REPLACE_ME/code/FBNAS
+    conda_env: eeg
+    python: python
+    scheduler: "none"   # quote it: bare `none` is YAML null, not the string
+    gpu: "0"

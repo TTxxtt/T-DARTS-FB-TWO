@@ -1,0 +1,42 @@
+{
+  "_generated_from": "configs/servers.yaml",
+  "default_profile": "local",
+  "profiles": {
+    "local": {
+      "kind": "local",
+      "host": "DESKTOP-JNLTK3I",
+      "auto": [
+        "DESKTOP-JNLTK3I"
+      ],
+      "data_root": "D:/code/T-DARTS-FB/data",
+      "output_root": "D:/code/T-DARTS-FB/outputs",
+      "upstream_root": "D:/code/T-DARTS-FB/FBNAS",
+      "conda_env": null,
+      "python": "python"
+    },
+    "serverA": {
+      "kind": "remote",
+      "host": null,
+      "auto": null,
+      "data_root": "/gpfs/REPLACE_ME/datasets",
+      "output_root": "/gpfs/REPLACE_ME/outputs",
+      "upstream_root": "/gpfs/REPLACE_ME/code/FBNAS",
+      "conda_env": "eeg",
+      "python": "python",
+      "scheduler": "slurm",
+      "gpu": "0"
+    },
+    "serverB": {
+      "kind": "remote",
+      "host": null,
+      "auto": null,
+      "data_root": "/home/REPLACE_ME/data",
+      "output_root": "/home/REPLACE_ME/outputs",
+      "upstream_root": "/home/REPLACE_ME/code/FBNAS",
+      "conda_env": "eeg",
+      "python": "python",
+      "scheduler": "none",
+      "gpu": "0"
+    }
+  }
+}
