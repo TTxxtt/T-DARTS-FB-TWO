@@ -22,9 +22,9 @@ from torch.utils.data import DataLoader
 
 from run_layout import allocate
 from tdarts.architect import SearchArchitect
-from tdarts.genotype import extract_genotype, save_genotype
+from tdarts.genotype import Genotype, PathGene, extract_genotype, save_genotype
 from tdarts.mixed_op import TemporalDARTSNet, candidate_names
-from tdarts.search import evaluate, run_search_epoch
+from tdarts.search import evaluate, run_search_epoch, should_update_alphas
 from tdarts.search_data import load_session0_search_split
 
 
@@ -45,6 +45,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha-weight-decay", type=float, default=1e-3)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--checkpoint-interval", type=int, default=10)
+    parser.add_argument(
+        "--alpha-update-mode",
+        choices=("minibatch", "fullval"),
+        default="minibatch",
+        help="minibatch (default) cycles one validation batch per weight step, "
+        "the original DARTS schedule; fullval runs one accumulated step over "
+        "the whole validation loader after each epoch's weight training.",
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.9,
+        help="decay for the EMA of softmax(alpha) used by --decode-mode ema; "
+        "the EMA starts at the first epoch warmup ends, never at epoch 1.",
+    )
+    parser.add_argument(
+        "--decode-mode",
+        choices=("last", "ema"),
+        default="last",
+        help="which genotype genotype.json points at: the final epoch's argmax "
+        "(default, historical behaviour) or the argmax of the EMA "
+        "probabilities.  Both are written either way.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -84,6 +107,63 @@ def _architecture_summary(model: TemporalDARTSNet) -> dict[str, Any]:
     return summary
 
 
+def _update_ema_probabilities(
+    ema_probabilities: dict[tuple[str, int], torch.Tensor],
+    model: TemporalDARTSNet,
+    decay: float,
+) -> None:
+    """Fold the current ``softmax(alpha)`` into the running average, in place.
+
+    Only ever called once the warmup has ended, so the average never contains
+    the near-uniform logits every search starts from.
+    """
+
+    with torch.no_grad():
+        for key, alpha in model.alphas().items():
+            probabilities = torch.softmax(alpha.detach(), dim=0).cpu()
+            if key in ema_probabilities:
+                ema_probabilities[key].mul_(decay).add_(probabilities, alpha=1.0 - decay)
+            else:
+                ema_probabilities[key] = probabilities.clone()
+
+
+def _genotype_from_ema(
+    model: TemporalDARTSNet,
+    ema_probabilities: dict[tuple[str, int], torch.Tensor],
+    *,
+    seed: int,
+    epoch: int,
+) -> Genotype:
+    """Build the genotype from the EMA probabilities instead of one epoch.
+
+    ``extract_genotype`` reads a single logged epoch -- at this budget, the
+    last -- and the last epoch's argmax is precisely the quantity that keeps
+    moving.  Averaging the probabilities first asks which candidate wins on
+    average rather than which one happened to lead when training stopped.
+    """
+
+    if not ema_probabilities:
+        raise ValueError("no EMA probabilities were accumulated")
+    genes = []
+    for (band, path), probabilities in sorted(
+        ema_probabilities.items(), key=lambda item: f"{item[0][0]}_path{item[0][1] + 1}"
+    ):
+        index = int(probabilities.argmax())
+        names = candidate_names(band)
+        alpha = model.alphas()[(band, path)]
+        genes.append(
+            PathGene(
+                band=band,
+                path=path,
+                candidate_index=index,
+                candidate=names[index],
+                alpha=float(alpha.detach().cpu()[index]),
+                probability=float(probabilities[index]),
+            )
+        )
+    return Genotype(seed=seed, epoch=epoch, genes=tuple(genes))
+
+
 def _write_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -121,6 +201,8 @@ def main() -> int:
         raise ValueError("epochs/batch-size must be positive and warmup-epochs non-negative")
     if args.epochs <= args.warmup_epochs:
         raise ValueError("epochs must exceed warmup-epochs so alpha can be updated")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError("ema-decay must lie in [0, 1)")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
@@ -169,6 +251,7 @@ def main() -> int:
     _write_json(args.output_dir / "manifest.json", manifest)
 
     metrics_path = args.output_dir / "metrics.jsonl"
+    ema_probabilities: dict[tuple[str, int], torch.Tensor] = {}
     started = time.perf_counter()
     with metrics_path.open("x", encoding="utf-8") as metrics_handle, \
             progress_path.open("w", encoding="utf-8") as progress:
@@ -189,7 +272,12 @@ def main() -> int:
                 epoch=epoch,
                 device=device,
                 warmup_epochs=args.warmup_epochs,
+                alpha_update_mode=args.alpha_update_mode,
             )
+            # Same gate the alpha update uses, so the average starts on the
+            # first epoch whose logits were actually trained.
+            if should_update_alphas(epoch, args.warmup_epochs):
+                _update_ema_probabilities(ema_probabilities, model, args.ema_decay)
             validation = evaluate(model, val_loader, criterion, device=device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -222,21 +310,39 @@ def main() -> int:
             if epoch % args.checkpoint_interval == 0 or epoch == args.epochs:
                 _checkpoint(args.output_dir / f"checkpoint_epoch_{epoch:03d}.pt", epoch=epoch, model=model, architect=architect, args=args)
 
-    # Export the Top-1 genotype as the artefact the retrain stage consumes:
-    # train_retrain.py --genotype-json reads this file without re-deriving the
-    # architecture from the alpha logits, so a search and a hand-built genotype
-    # enter retraining through the identical door.  Building it from the logged
-    # metrics (rather than from model.alphas()) reuses the ordering check that
+    # Export the genotypes the retrain stage consumes.  train_retrain.py
+    # --genotype-json reads these without re-deriving the architecture from the
+    # alpha logits, so a search and a hand-built genotype enter retraining
+    # through the identical door.  The last-epoch one is built from the logged
+    # metrics (rather than from model.alphas()) so it reuses the ordering check
     # extract_genotype already applies to every other consumer.
-    genotype_path = save_genotype(
-        extract_genotype(metrics_path, epoch=args.epochs),
-        args.output_dir / "genotype.json",
+    #
+    # Both are written regardless of --decode-mode: they come from the same
+    # search, so comparing the two retrains is the only way to separate "did the
+    # full-validation step change the search" from "did averaging the
+    # probabilities change the decoded architecture".
+    last_genotype = extract_genotype(metrics_path, epoch=args.epochs)
+    last_path = save_genotype(last_genotype, args.output_dir / "genotype_last.json")
+    ema_genotype = _genotype_from_ema(
+        model, ema_probabilities, seed=args.seed, epoch=args.epochs
     )
+    ema_path = save_genotype(ema_genotype, args.output_dir / "genotype_ema.json")
+    selected = ema_genotype if args.decode_mode == "ema" else last_genotype
+    genotype_path = save_genotype(selected, args.output_dir / "genotype.json")
+
+    agreeing = [
+        gene.candidate == ema_genotype.genes[index].candidate
+        for index, gene in enumerate(last_genotype.genes)
+    ]
     final = {
         "completed": True,
         "total_search_seconds": time.perf_counter() - started,
         "final_paths": _architecture_summary(model),
         "genotype_json": str(genotype_path),
+        "decode_mode": args.decode_mode,
+        "genotype_last_json": str(last_path),
+        "genotype_ema_json": str(ema_path),
+        "genotype_last_vs_ema_agreeing_paths": sum(agreeing),
     }
     _write_json(args.output_dir / "final_summary.json", final)
     print(json.dumps(final, ensure_ascii=False, indent=2, sort_keys=True))

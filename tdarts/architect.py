@@ -6,6 +6,11 @@ updates used in stage 3:
 * a train batch updates network weights ``w``;
 * a validation batch updates architecture logits ``alpha``.
 
+The alpha update comes in two schedules.  :meth:`SearchArchitect.alpha_step`
+takes one validation batch, which the minibatch runner calls once per weight
+step; :meth:`SearchArchitect.alpha_step_loader` takes the entire validation
+loader and applies a single accumulated step per epoch.
+
 There is no unrolling, genotype decoding, discrete model, or retraining here.
 The alpha update is particularly defensive: network parameters are disabled and
 restored, while every BatchNorm module is switched to evaluation mode so its
@@ -16,7 +21,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import torch
 import torch.nn as nn
@@ -177,3 +182,74 @@ class SearchArchitect:
                 for parameter, original in zip(self.network_parameters, network_snapshot):
                     parameter.copy_(original)
         return result
+
+    def alpha_step_loader(
+        self,
+        loader: Iterable[tuple[torch.Tensor, torch.Tensor]],
+        criterion: nn.Module,
+        *,
+        device: torch.device,
+    ) -> StepResult:
+        """Update only ``alpha`` from the whole validation loader, in one step.
+
+        :meth:`alpha_step` consumes one validation batch, which the minibatch
+        schedule calls once per weight step -- roughly fifteen Adam steps per
+        epoch on the BCI-IV-2a split.  This variant accumulates the gradient of
+        the *entire* validation set and applies a single step, so the
+        architecture receives one low-variance estimate of
+        ``grad_alpha L_val`` per epoch instead of fifteen high-variance ones.
+
+        ``criterion`` returns a batch mean, so each batch's contribution is
+        scaled by ``batch_samples / total_samples`` before it is accumulated.
+        Without that scaling a trailing short batch would carry the same weight
+        as a full one.  The loader must therefore expose a sized ``dataset``,
+        and the number of samples actually yielded is checked against it
+        rather than trusted.
+
+        The snapshot and BatchNorm freeze mirror :meth:`alpha_step` for the same
+        reason: the constrained backbone layers can renormalise ``.data`` during
+        a forward pass, so ``w`` and the running statistics are restored
+        byte-for-byte once the step is done.
+        """
+
+        self.model.train()
+        self.alpha_optimizer.zero_grad(set_to_none=True)
+        for parameter in self.network_parameters:
+            parameter.grad = None
+        network_snapshot = [p.detach().clone() for p in self.network_parameters]
+
+        total_samples = len(loader.dataset)  # type: ignore[attr-defined]
+        if total_samples == 0:
+            raise ValueError("validation loader is empty")
+        loss_sum = 0.0
+        correct = count = 0
+        try:
+            with _requires_grad(self.network_parameters, False), freeze_batch_norm_stats(self.model):
+                for inputs, targets in loader:
+                    inputs = inputs.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+                    logits, _ = self.model(inputs)
+                    loss = criterion(logits, targets)
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError("non-finite full-validation NLL")
+                    batch_samples = int(targets.numel())
+                    (loss * (batch_samples / total_samples)).backward()
+                    loss_sum += float(loss.detach().item()) * batch_samples
+                    correct += int((logits.detach().argmax(dim=1) == targets).sum().item())
+                    count += batch_samples
+                if count != total_samples:
+                    raise ValueError(
+                        f"validation loader yielded {count} samples but its dataset holds "
+                        f"{total_samples}; the per-batch weighting would be wrong"
+                    )
+                grad_norm = _grad_norm(self.arch_parameters)
+                self.alpha_optimizer.step()
+        finally:
+            with torch.no_grad():
+                for parameter, original in zip(self.network_parameters, network_snapshot):
+                    parameter.copy_(original)
+        return StepResult(
+            nll=loss_sum / count,
+            accuracy=correct / count,
+            grad_norm=grad_norm,
+        )

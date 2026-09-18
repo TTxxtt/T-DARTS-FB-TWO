@@ -41,17 +41,33 @@ def run_search_epoch(
     epoch: int,
     device: torch.device,
     warmup_epochs: int = 20,
+    alpha_update_mode: str = "minibatch",
 ) -> dict[str, Any]:
     """Run alternating first-order DARTS updates for one epoch.
 
-    Validation batches are cycled so that every weight update has one alpha
-    update after warm-up.  Epoch-level validation metrics are deliberately
-    computed separately by :func:`evaluate`; alpha-step samples are optimizer
-    inputs rather than a full validation report.
+    ``alpha_update_mode`` selects where the architecture gradient comes from:
+
+    ``"minibatch"``
+        Validation batches are cycled so that every weight update has one alpha
+        update after warm-up -- roughly one Adam step per train batch.  This is
+        the original DARTS schedule and the default.
+
+    ``"fullval"``
+        The train loop runs to completion first, then the architecture takes a
+        single step accumulated over the whole validation loader.  One step per
+        epoch, with a lower-variance gradient; the step-frequency change is
+        itself part of the method, so it is deliberately not offset elsewhere.
+
+    Either way, epoch-level validation metrics are computed separately by
+    :func:`evaluate`; alpha-step samples are optimizer inputs rather than a full
+    validation report.
     """
 
+    if alpha_update_mode not in {"minibatch", "fullval"}:
+        raise ValueError(f"unknown alpha_update_mode={alpha_update_mode!r}")
+
     update_alpha = should_update_alphas(epoch, warmup_epochs)
-    val_iterator = iter(val_loader)
+    val_iterator = iter(val_loader) if alpha_update_mode == "minibatch" else None
     total_train_nll = total_train_acc = total_weight_grad = 0.0
     total_alpha_nll = total_alpha_acc = total_alpha_grad = 0.0
     train_steps = alpha_steps = 0
@@ -64,7 +80,7 @@ def run_search_epoch(
         total_train_acc += weight_result.accuracy
         total_weight_grad += weight_result.grad_norm
 
-        if update_alpha:
+        if update_alpha and alpha_update_mode == "minibatch":
             try:
                 val_batch = next(val_iterator)
             except StopIteration:
@@ -76,6 +92,15 @@ def run_search_epoch(
             total_alpha_nll += alpha_result.nll
             total_alpha_acc += alpha_result.accuracy
             total_alpha_grad += alpha_result.grad_norm
+
+    # Everything that updates w has now run, so the architecture sees the
+    # epoch-end network rather than a mixture of states within the epoch.
+    if update_alpha and alpha_update_mode == "fullval":
+        alpha_result = architect.alpha_step_loader(val_loader, criterion, device=device)
+        alpha_steps = 1
+        total_alpha_nll = alpha_result.nll
+        total_alpha_acc = alpha_result.accuracy
+        total_alpha_grad = alpha_result.grad_norm
 
     return {
         "train_nll": _mean(total_train_nll, train_steps),

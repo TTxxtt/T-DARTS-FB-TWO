@@ -27,6 +27,19 @@ OUTARM=${OUTARM:-darts}
 # a third of the budget.  Running both at the same epoch count makes the pair a
 # clean ablation of the architecture step size alone.
 ALPHA_LR=${ALPHA_LR:-3e-4}
+# Where the architecture gradient comes from.  minibatch is the original DARTS
+# schedule -- one validation batch per weight step, ~15 Adam steps per epoch --
+# and stays the default so every archived search reproduces exactly.  fullval
+# instead takes one accumulated step over the whole 57-trial validation set per
+# epoch.  The step-frequency change is part of the method, not a knob to offset
+# against ALPHA_LR.
+ALPHA_UPDATE_MODE=${ALPHA_UPDATE_MODE:-minibatch}
+# Which genotype genotype.json points at.  last is the historical behaviour (the
+# final epoch's argmax); ema decodes the argmax of the averaged probabilities.
+# The search writes genotype_last.json and genotype_ema.json either way, so this
+# decides only which one genotype.json aliases -- both stay retrainable.
+DECODE_MODE=${DECODE_MODE:-last}
+EMA_DECAY=${EMA_DECAY:-0.9}
 # SUB is a 0-based index into the nine BCI-IV-2a subjects, matching the
 # subTorun index run_fbnas_subject.py uses, so both arms take the same SUB.
 # The dataset spells its subjects 001..009, hence the +1: SUB=0 is subject 001
@@ -60,5 +73,8 @@ srun python "$REPO/train_search.py" \
   --seed "$SEED" \
   --epochs "$EPOCHS" \
   --warmup-epochs 20 \
-  --alpha-lr "$ALPHA_LR"
+  --alpha-lr "$ALPHA_LR" \
+  --alpha-update-mode "$ALPHA_UPDATE_MODE" \
+  --decode-mode "$DECODE_MODE" \
+  --ema-decay "$EMA_DECAY"
 echo "=== DARTS sub=$SUBJ done rc=$? $(date) ==="
