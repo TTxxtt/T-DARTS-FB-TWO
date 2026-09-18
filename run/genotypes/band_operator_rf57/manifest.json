@@ -1,0 +1,78 @@
+{
+  "anchor": "dilated_rf57",
+  "bands": [
+    "Low",
+    "Mid",
+    "High"
+  ],
+  "baseline_file": "baseline_dd.json",
+  "collapsed": {
+    "high_dilated": "identical to baseline_dd",
+    "low_dilated": "identical to baseline_dd",
+    "mid_dilated": "identical to baseline_dd"
+  },
+  "operators": [
+    "dilated",
+    "normal",
+    "dwsep",
+    "lkdw"
+  ],
+  "rf": 57,
+  "scheme": "band_operator_probe_rf57",
+  "varied": [
+    {
+      "arm": "low_normal",
+      "band": "Low",
+      "file": "low_normal.json",
+      "operator": "normal"
+    },
+    {
+      "arm": "low_dwsep",
+      "band": "Low",
+      "file": "low_dwsep.json",
+      "operator": "dwsep"
+    },
+    {
+      "arm": "low_lkdw",
+      "band": "Low",
+      "file": "low_lkdw.json",
+      "operator": "lkdw"
+    },
+    {
+      "arm": "mid_normal",
+      "band": "Mid",
+      "file": "mid_normal.json",
+      "operator": "normal"
+    },
+    {
+      "arm": "mid_dwsep",
+      "band": "Mid",
+      "file": "mid_dwsep.json",
+      "operator": "dwsep"
+    },
+    {
+      "arm": "mid_lkdw",
+      "band": "Mid",
+      "file": "mid_lkdw.json",
+      "operator": "lkdw"
+    },
+    {
+      "arm": "high_normal",
+      "band": "High",
+      "file": "high_normal.json",
+      "operator": "normal"
+    },
+    {
+      "arm": "high_dwsep",
+      "band": "High",
+      "file": "high_dwsep.json",
+      "operator": "dwsep"
+    },
+    {
+      "arm": "high_lkdw",
+      "band": "High",
+      "file": "high_lkdw.json",
+      "operator": "lkdw"
+    }
+  ]
+}

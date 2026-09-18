@@ -1,0 +1,54 @@
+{
+  "epoch": 0,
+  "genes": [
+    {
+      "alpha": 0.0,
+      "band": "High",
+      "candidate": "dilated_rf57",
+      "candidate_index": 2,
+      "path": 0,
+      "probability": 1.0
+    },
+    {
+      "alpha": 0.0,
+      "band": "High",
+      "candidate": "dilated_rf113",
+      "candidate_index": 3,
+      "path": 1,
+      "probability": 1.0
+    },
+    {
+      "alpha": 0.0,
+      "band": "Low",
+      "candidate": "dilated_rf57",
+      "candidate_index": 2,
+      "path": 0,
+      "probability": 1.0
+    },
+    {
+      "alpha": 0.0,
+      "band": "Low",
+      "candidate": "dilated_rf113",
+      "candidate_index": 3,
+      "path": 1,
+      "probability": 1.0
+    },
+    {
+      "alpha": 0.0,
+      "band": "Mid",
+      "candidate": "dilated_rf57",
+      "candidate_index": 2,
+      "path": 0,
+      "probability": 1.0
+    },
+    {
+      "alpha": 0.0,
+      "band": "Mid",
+      "candidate": "dilated_rf113",
+      "candidate_index": 3,
+      "path": 1,
+      "probability": 1.0
+    }
+  ],
+  "seed": 20190821
+}

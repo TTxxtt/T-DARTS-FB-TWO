@@ -5,9 +5,11 @@ vendored unmodified under `FBNAS/`, and new work lives alongside it in `tdarts/`
 so the two can be diffed file by file.
 
 **Stage 2 is complete**: the 14-candidate `MixedTemporalOp`, the two-path
-temporal cell, and the full `TemporalDARTSNet` supernet. There is still
-deliberately no DARTS: no architecture optimiser, no architecture step, no
-genotype, no retrain. `alpha` exists and starts near-uniform.
+temporal cell, and the full `TemporalDARTSNet` supernet. Stage 3 adds the
+first-order DARTS search (`train_search.py`) with its fixed-genotype retrain
+(`train_retrain.py`), plus a **separate anchored search arm**
+(`train_anchor_search.py`, `tdarts/anchored.py`) that keeps one path dilated and
+searches the complement; see [docs/anchored_search.md](docs/anchored_search.md).
 
 ## Repository layout
 
@@ -23,7 +25,12 @@ T-DARTS-FB/
 │   ├── config.py              # machine profiles + search-space constants
 │   ├── temporal_ops.py        # 4 operators x 4 receptive fields
 │   ├── mixed_op.py            # MixedTemporalOp, TwoPathTemporalCell, TemporalDARTSNet
+│   ├── architect.py           # first-order DARTS steps with BN/w isolation
+│   ├── search.py              # search epoch + evaluation primitives
+│   ├── anchored.py            # anchored arm: dilated anchor -> operator -> RF
 │   ├── backbone.py            # SCB / LogVar / classifier, unchanged from FBNAS
+│   ├── genotype.py            # genotype extraction
+│   ├── discrete_network.py    # fixed-genotype network
 │   ├── init_utils.py          # name-addressed deterministic initialisation
 │   └── cli.py                 # `t-darts-profile`
 ├── tests/
@@ -31,11 +38,17 @@ T-DARTS-FB/
 │   ├── test_mixed_op.py              # stage-2 architecture audit
 │   ├── test_fbnas_compatibility.py   # new ops vs untouched SCB / LogVar
 │   ├── test_backbone.py              # fixed backbone shape chain
+│   ├── test_architect.py             # w/alpha isolation and BN freezing
+│   ├── test_anchored.py              # anchored schedule, no-duplicate, genotype
 │   ├── test_init_utils.py            # deterministic init
 │   ├── test_config.py
 │   └── test_cli.py
 ├── configs/servers.yaml       # machine profiles -- edit this one
+├── train_search.py            # 14-candidate joint DARTS search
+├── train_anchor_search.py     # anchored: phase A (operator) -> phase B (RF)
+├── train_retrain.py           # final training of one genotype
 ├── docs/fbnas_audit.md        # what the baseline actually does
+├── docs/anchored_search.md    # the anchored arm, phase by phase
 ├── scripts/smoke_stage1.py    # quick end-to-end sanity check
 └── tools/                     # mirror / config-sync utilities
 ```
@@ -117,7 +130,8 @@ python tests/test_mixed_op.py              # 39 / 39 PASS
 python tests/test_fbnas_compatibility.py   # COMPATIBLE
 python tests/test_backbone.py              # 16 / 16 PASS
 python tests/test_init_utils.py            # 18 / 18 PASS
-python -m unittest discover -s tests -t .  # 195 tests
+python tests/test_anchored.py              # 33 / 33 PASS
+python -m unittest discover -s tests -t .  # 236 tests
 ```
 
 The temporal audit checks, per candidate: construction, forward, backward,
@@ -166,6 +180,33 @@ one-hot vector makes the mixed output identical to that single operator, so the
 discrete model is an exact special case of the supernet. (A large finite logit is
 used rather than `inf`, since `softmax` with an infinite logit produces NaN
 gradients and would make the check pass for the wrong reason.)
+
+
+## Anchored search (`path0 = dilated`, then RF)
+
+A second, separate search space lives in `tdarts/anchored.py`. Path 0 keeps the
+FBNAS `dilated` mechanism; phase A searches path 1's operator family under a
+balanced 29/57/113 schedule, then phase B freezes the operator and searches the
+RF of both paths over 15/29/57/113. RF 15 is excluded from phase A only, because
+`dilated == normal` and `dwsep == lkdw` there.
+
+Phase A's schedule **marginalises** path 0's scale -- it does not search it.
+Path 0's RF is decided by `gamma_anchor` in phase B; the phase A anchor simply
+follows the same schedule so all four operators are compared at one common
+scale per step.
+
+```bash
+python train_anchor_search.py --help          # phase A -> phase B -> genotype.json
+python train_retrain.py --genotype-json <run>/genotype.json ...   # from scratch
+```
+
+`--no-duplicate-paths` decodes the two paths of each band jointly and forbids
+equal `structure_key = (kernel, dilation, separable)` values, so RF-15 aliases
+count as duplicates while dense-vs-separable pairs do not. The phase B hard
+subnet is decoded with the same constrained pair.
+
+See [docs/anchored_search.md](docs/anchored_search.md) for the full protocol,
+artifacts and code map.
 
 
 ## Candidate normalisation

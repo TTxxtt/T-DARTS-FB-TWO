@@ -1,0 +1,18 @@
+{
+  "bands": "Low/Mid/High share the same (path0, path1) pair",
+  "files": {
+    "dilated_rf57": "path1_dilated_rf57.json",
+    "dwsep_rf57": "path1_dwsep_rf57.json",
+    "lkdw_rf57": "path1_lkdw_rf57.json",
+    "normal_rf57": "path1_normal_rf57.json"
+  },
+  "path0": "dilated_rf57",
+  "path1_variants": [
+    "dilated_rf57",
+    "normal_rf57",
+    "dwsep_rf57",
+    "lkdw_rf57"
+  ],
+  "receptive_field": 57,
+  "search_produced": false
+}
