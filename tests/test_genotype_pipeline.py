@@ -210,6 +210,64 @@ class RetrainCliTests(unittest.TestCase):
         )
         self.assertTrue(args.no_duplicate_paths)
 
+    def test_stage2_fixed_epochs_defaults_to_off(self):
+        """Default None keeps the historical threshold rule, which is what every
+        archived run -- and therefore every published number -- used."""
+        args = self._parse(["--genotype-json", "g.json", "--seed", "1"])
+        self.assertIsNone(args.stage2_fixed_epochs)
+
+    def test_stage2_fixed_epochs_can_be_requested(self):
+        args = self._parse(
+            ["--genotype-json", "g.json", "--seed", "1", "--stage2-fixed-epochs", "200"]
+        )
+        self.assertEqual(args.stage2_fixed_epochs, 200)
+
+    def test_stage2_min_epochs_defaults_to_off(self):
+        """0 is the historical rule: the threshold break is allowed at any
+        epoch.  Every archived run was produced under it."""
+        args = self._parse(["--genotype-json", "g.json", "--seed", "1"])
+        self.assertEqual(args.stage2_min_epochs, 0)
+
+    def test_stage2_min_epochs_can_be_requested(self):
+        args = self._parse(
+            ["--genotype-json", "g.json", "--seed", "1", "--stage2-min-epochs", "100"]
+        )
+        self.assertEqual(args.stage2_min_epochs, 100)
+
+    def test_stage2_min_epochs_rejects_negative(self):
+        with self.assertRaises(ValueError):
+            with mock.patch.object(
+                sys, "argv",
+                ["train_retrain.py", "--genotype-json", "g.json", "--seed", "1",
+                 "--stage2-min-epochs", "-5"],
+            ):
+                train_retrain.main()
+
+    def test_stage2_min_and_fixed_are_mutually_exclusive(self):
+        """Both knobs pin the length in different ways; silently letting one win
+        would make final_summary.json's stop_reason the only record of which."""
+        with self.assertRaises(ValueError):
+            with mock.patch.object(
+                sys, "argv",
+                ["train_retrain.py", "--genotype-json", "g.json", "--seed", "1",
+                 "--stage2-min-epochs", "100", "--stage2-fixed-epochs", "200"],
+            ):
+                train_retrain.main()
+
+    def test_stage2_fixed_epochs_must_be_positive(self):
+        """A zero or negative fixed length would make Stage 2 run no epochs at
+        all and still report a Session-1 test reading from the Stage-1 model,
+        which reads as a completed Stage 2 in final_summary.json."""
+        for value in ("0", "-1"):
+            with self.assertRaises(ValueError):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["train_retrain.py", "--genotype-json", "g.json", "--seed", "1",
+                     "--stage2-fixed-epochs", value],
+                ):
+                    train_retrain.main()
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

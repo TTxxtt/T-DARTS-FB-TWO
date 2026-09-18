@@ -65,9 +65,24 @@ NUM_WORKERS=${NUM_WORKERS:-0}
 EXTRA=""
 [ "$OBSERVE_TEST" = 1 ] && EXTRA="$EXTRA --observe-test"
 [ "$PRELOAD" = 1 ] && EXTRA="$EXTRA --preload-data"
+# STAGE2_FIXED=N runs Stage 2 for exactly N epochs and disables the
+# val_nll < stage-1-terminal-train_nll early stop, which otherwise ends a
+# subject's Stage 2 as soon as its validation NLL dips below the Stage-1
+# threshold (s009 stopped at epoch 9 of a 600-epoch budget).  Unset keeps the
+# historical rule.  A fixed-epoch run is OFF-PROTOCOL: its Session-1 reading is
+# comparable only to another fixed-epoch run, never to the threshold-stopped
+# archive.
+STAGE2_FIXED=${STAGE2_FIXED:-}
+[ -n "$STAGE2_FIXED" ] && EXTRA="$EXTRA --stage2-fixed-epochs $STAGE2_FIXED"
+# STAGE2_MIN=N floors Stage 2's length: the threshold break is not allowed
+# before epoch N.  Unlike STAGE2_FIXED the run still stops on the threshold, so
+# it stays on the same rule as the archive -- only the handful of runs that
+# stopped after a few epochs are extended.  Give one of the two, not both.
+STAGE2_MIN=${STAGE2_MIN:-}
+[ -n "$STAGE2_MIN" ] && EXTRA="$EXTRA --stage2-min-epochs $STAGE2_MIN"
 
 echo "=== DARTS retrain sub=$SUBJ seed=$SEED host=$(hostname) $(date) ==="
-echo "=== observe_test=$OBSERVE_TEST preload=$PRELOAD num_workers=$NUM_WORKERS ==="
+echo "=== observe_test=$OBSERVE_TEST preload=$PRELOAD num_workers=$NUM_WORKERS stage2_fixed=${STAGE2_FIXED:-none} ==="
 # --arm "" keeps the leaf as the plain train_s<subject>_seed<seed>, matching the
 # search leaf beside it.
 srun python "$REPO/train_retrain.py" \

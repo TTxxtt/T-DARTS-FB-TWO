@@ -83,6 +83,30 @@ def parse_args() -> argparse.Namespace:
         "one selection rule.",
     )
     parser.add_argument("--stage2-epochs", type=int, default=600)
+    parser.add_argument(
+        "--stage2-min-epochs",
+        type=int,
+        default=0,
+        help="floor on Stage 2's length: the val_nll < stage-1-terminal-train_nll "
+        "break is not allowed before this epoch.  Default 0 is the historical "
+        "rule, which let a subject whose validation NLL dips early stop after a "
+        "handful of epochs (s009 stopped at 9, one random run at 7) -- far less "
+        "training than every other subject got.  The break still applies once "
+        "the floor is reached, so this lowers nothing and only extends the "
+        "shortest runs.",
+    )
+    parser.add_argument(
+        "--stage2-fixed-epochs",
+        type=int,
+        default=None,
+        help="run Stage 2 for exactly this many epochs, ignoring the "
+        "val_nll < stage-1-terminal-train_nll early stop.  Default None keeps "
+        "the historical threshold rule, which is what every archived run used.  "
+        "A run using this flag is NOT on that protocol, so its Session-1 "
+        "reading is comparable only to another fixed-epoch run -- not to the "
+        "threshold-stopped majority.  Equivalent to --stage2-min-epochs N "
+        "--stage2-epochs N; give one or the other, not both.",
+    )
     parser.add_argument("--observe-test", action="store_true", help="log Session1 metrics only; never select on them")
     parser.add_argument(
         "--no-duplicate-paths",
@@ -269,6 +293,15 @@ def main() -> int:
     args = parse_args()
     if args.max_epochs < 1 or args.patience < 1 or args.stage2_epochs < 1:
         raise ValueError("max-epochs, patience, and stage2-epochs must be positive")
+    if args.stage2_fixed_epochs is not None and args.stage2_fixed_epochs < 1:
+        raise ValueError("--stage2-fixed-epochs must be positive when given")
+    if args.stage2_min_epochs < 0:
+        raise ValueError("--stage2-min-epochs cannot be negative")
+    if args.stage2_fixed_epochs is not None and args.stage2_min_epochs:
+        raise ValueError(
+            "--stage2-fixed-epochs already pins the length; drop "
+            "--stage2-min-epochs to keep which rule ran unambiguous"
+        )
     if (args.search_dir is None) == (args.genotype_json is None):
         raise ValueError("give exactly one of --search-dir or --genotype-json")
     if args.genotype_json is not None and args.initialization == "transfer":
@@ -320,7 +353,9 @@ def main() -> int:
         #     it trains far longer before qualifying.
         threshold_a = float(stage1["best_score"])
         threshold_b = _stage1_terminal_train_nll(run_dir, stage1)
-        stage2_epochs = args.stage2_epochs
+        # --stage2-fixed-epochs turns the budget into the exact length: the loop
+        # still runs to this count, but the threshold break below is disabled.
+        stage2_epochs = args.stage2_fixed_epochs or args.stage2_epochs
         progress_path = run_dir.parent.parent / "logs" / args.dataset / f"train_s{args.subject}_seed{args.seed}_{args.arm}.log"
         progress_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"run dir (stage2-only): {run_dir}", flush=True)
@@ -342,6 +377,12 @@ def main() -> int:
             generator=torch.Generator().manual_seed(args.seed + 1), **loader_kwargs
         )
         criterion = nn.NLLLoss()
+        # Same seeding rule as the main path: seed right before the model is
+        # built.  Stage 2 overwrites the weights from best.pt immediately below,
+        # so this only matters for the RNG state the dataloaders and any later
+        # draw see -- but leaving the branch unseeded made a --stage2-only run
+        # depend on whatever the process inherited.
+        set_seed(args.seed)
         model = TemporalDiscreteNet(genotype).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         best_ckpt = torch.load(best_path, map_location=device)
@@ -377,6 +418,8 @@ def main() -> int:
                 log.flush()
                 fields = {"trainLoss": train["nll"], "trainAcc": train["acc"], "trainLossEval": train_eval["nll"], "valLoss": val["nll"], "valAcc": val["acc"]}
                 notes = [f"thrA {threshold_a:.4f} thrB {'%.4f' % threshold_b if threshold_b is not None else 'n/a'}"]
+                if args.stage2_min_epochs:
+                    notes.append(f"floor {stage2_epoch}/{args.stage2_min_epochs}")
                 b_crossed_now = threshold_b is not None and crossed_b is None and val["nll"] <= threshold_b
                 a_crossed_now = crossed_a is None and val["nll"] <= threshold_a
                 if b_crossed_now or a_crossed_now:
@@ -393,9 +436,14 @@ def main() -> int:
                 print(line, flush=True)
                 progress.write(line + "\n")
                 progress.flush()
-                if crossed_a is not None and (threshold_b is None or crossed_b is not None):
+                if (args.stage2_fixed_epochs is None
+                        and stage2_epoch >= args.stage2_min_epochs
+                        and crossed_a is not None
+                        and (threshold_b is None or crossed_b is not None)):
                     stage2_stop_reason = "all_thresholds_crossed"
                     break
+            if args.stage2_fixed_epochs is not None:
+                stage2_stop_reason = "fixed_epochs"
             progress.write(f"[stage2] done | epochs {stage2_epoch} | reason {stage2_stop_reason}\n")
             progress.flush()
         torch.save({"stage2_epoch": stage2_epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict()}, run_dir / "stage2_final.pt")
@@ -496,7 +544,6 @@ def main() -> int:
             "--no-duplicate-paths: both paths realise the same structure in "
             f"{len(duplicate_bands)} band(s) -- {details}"
         )
-    set_seed(args.seed)
     args.output_dir, progress_path = allocate(
         root=args.output_root, log_root=args.log_root, dataset=args.dataset, phase="train",
         subject=args.subject, seed=args.seed, arm=args.arm,
@@ -504,6 +551,16 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=False)
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"run dir: {args.output_dir}\nlog:     {progress_path}", flush=True)
+    # Seeding happens HERE, immediately before the model is built, and not a
+    # line earlier.  Resolving the genotype is not free with respect to the
+    # global torch RNG: load_genotype and extract_genotype build the whole
+    # candidate operator pool, and every nn.Conv2d.__init__ draws from that RNG.
+    # So with set_seed placed before the resolution, a --search-dir run and a
+    # --genotype-json run consume different numbers of draws and start from
+    # DIFFERENT initial weights for the same --seed.  That silently breaks the
+    # seed-matching every architecture comparison here rests on -- measured on
+    # s009 at epoch 1: 2.78 vs 2.19 train NLL, from the seed alone.
+    set_seed(args.seed)
     model = TemporalDiscreteNet(genotype).to(device)
     transferred = []
     if args.initialization == "transfer":
@@ -675,9 +732,13 @@ def main() -> int:
             ConcatDataset((train_data, val_data)), shuffle=True, generator=stage2_generator, **loader_kwargs
         )
         stage2_stop_reason = "max_epochs"
+        # --stage2-fixed-epochs makes the budget the exact length and disables
+        # the threshold break, so Stage 2 cannot end early on a subject whose
+        # validation NLL dips below the Stage-1 threshold within a few epochs.
+        stage2_limit = args.stage2_fixed_epochs or args.stage2_epochs
         with (args.output_dir / "metrics.jsonl").open("a", encoding="utf-8") as log, \
                 progress_path.open("a", encoding="utf-8") as progress:
-            for stage2_epoch in range(1, args.stage2_epochs + 1):
+            for stage2_epoch in range(1, stage2_limit + 1):
                 train = train_epoch(model, all_session0_loader, optimizer, criterion, device)
                 train_eval = evaluate(model, session0_eval_loader, criterion, device)
                 val = evaluate(model, val_loader, criterion, device)
@@ -696,16 +757,33 @@ def main() -> int:
                 if args.observe_test:
                     fields["testAcc"] = record["test_observation"]["acc"]
                     fields["testLoss"] = record["test_observation"]["nll"]
+                threshold_met = val["nll"] < stage1_terminal_train_nll
+                past_floor = stage2_epoch >= args.stage2_min_epochs
                 notes = [f"threshold {stage1_terminal_train_nll:.4f}"]
-                if val["nll"] < stage1_terminal_train_nll:
-                    notes.append("stop")
+                if args.stage2_fixed_epochs is not None:
+                    notes.append(f"fixed {stage2_epoch}/{stage2_limit}")
+                elif args.stage2_min_epochs:
+                    notes.append(f"floor {stage2_epoch}/{args.stage2_min_epochs}")
+                if threshold_met:
+                    if args.stage2_fixed_epochs is not None:
+                        notes.append("thr-met")
+                    elif past_floor:
+                        notes.append("stop")
+                    else:
+                        # Named separately from "stop": the run continues, and
+                        # a reader scanning the log must not think it ended.
+                        notes.append("thr-met-held")
                 line = format_progress_line("stage2", stage2_epoch, fields, tuple(notes))
                 print(line, flush=True)
                 progress.write(line + "\n")
                 progress.flush()
-                if val["nll"] < stage1_terminal_train_nll:
+                if args.stage2_fixed_epochs is None and threshold_met and past_floor:
                     stage2_stop_reason = "official_val_nll_lt_stage1_terminal_train_nll"
+                    if args.stage2_min_epochs:
+                        stage2_stop_reason += f"_after_floor{args.stage2_min_epochs}"
                     break
+            if args.stage2_fixed_epochs is not None:
+                stage2_stop_reason = "fixed_epochs"
             progress.write(f"[stage2] done | epochs {stage2_epoch} | reason {stage2_stop_reason} | threshold {stage1_terminal_train_nll:.4f}\n")
             progress.flush()
         torch.save({"stage2_epoch": stage2_epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict()}, args.output_dir / "stage2_final.pt")
