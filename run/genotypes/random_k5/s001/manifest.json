@@ -1,0 +1,72 @@
+{
+  "base_seed": 20250901,
+  "count": 5,
+  "records": [
+    {
+      "candidate_indices": [
+        7,
+        5,
+        2,
+        6,
+        9,
+        9
+      ],
+      "file": "g000.json",
+      "index": 0,
+      "sampling_seed": 20250901
+    },
+    {
+      "candidate_indices": [
+        1,
+        13,
+        3,
+        1,
+        6,
+        12
+      ],
+      "file": "g001.json",
+      "index": 1,
+      "sampling_seed": 20250902
+    },
+    {
+      "candidate_indices": [
+        6,
+        10,
+        1,
+        1,
+        6,
+        0
+      ],
+      "file": "g002.json",
+      "index": 2,
+      "sampling_seed": 20250903
+    },
+    {
+      "candidate_indices": [
+        11,
+        1,
+        0,
+        6,
+        11,
+        9
+      ],
+      "file": "g003.json",
+      "index": 3,
+      "sampling_seed": 20250904
+    },
+    {
+      "candidate_indices": [
+        8,
+        6,
+        0,
+        2,
+        13,
+        9
+      ],
+      "file": "g004.json",
+      "index": 4,
+      "sampling_seed": 20250905
+    }
+  ],
+  "sampling": "independent uniform candidate per path; duplicates rejected"
+}
