@@ -147,6 +147,24 @@ result, not a trend.
    +3 (`band_gated_e`), 0 (`dilated_e`) — at most 0.3% of the model. These are
    per-path 1×1/gate overheads, not width artefacts, and they are pinned by
    test so they cannot drift unnoticed.
+7. **The selection metric resolves to a single validation trial, and ties are
+   the norm.** Selecting on accuracy over 57 validation trials quantises the
+   score to `1/57 = 0.0175`. Measured after the fact on both arms:
+
+   * Arm A (`cali_bn_acc.npy`): the winner beats the best *strictly* lower score
+     by exactly `1.7544` — one trial — on **all nine** subjects, with between 1
+     and 16 candidates tied at the top.
+   * Arm B (Phase A traversal): the same, exactly one trial on **all nine**
+     subjects, with between 1 and 34 candidates tied at the top.
+
+   So in both arms the architecture is frequently settled by a tie-break rather
+   than by a margin, and a different tie-break rule could have picked a
+   different architecture. This is a property of the upstream protocol being
+   faithfully reproduced, **not** a defect introduced here — which is precisely
+   why the same metric was used for both arms. But it does bound what the
+   comparison can mean: the two arms are near-indifferent across large sets of
+   candidates on the validation split, so the comparison tests the *pipelines*
+   more than it tests sharply-resolved architectural preferences.
 
 ## Reproducing
 
