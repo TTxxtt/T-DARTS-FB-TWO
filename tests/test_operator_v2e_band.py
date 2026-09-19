@@ -825,6 +825,17 @@ class SubmitChainTests(unittest.TestCase):
         self.assertIn("--high \"$HIGH\"", job)
         self.assertIn("dilated_e", job)
 
+    def test_queue_ahead_is_off_by_default_and_bounded_by_the_submit_cap(self):
+        """Sitting PENDING behind a contended partition is opt-in: the default
+        must stay "wait for a real card", because a PENDING job is one more
+        thing to track and the free-card count is the honest signal."""
+        source = self._submit_source()
+        self.assertIn('QUEUE_AHEAD="${QUEUE_AHEAD:-0}"', source)
+        # It contributes pool slots and nothing else -- the pool has never
+        # bounded how many jobs go out, so this cannot oversubscribe the
+        # cluster; only the QOS submit cap bounds the queue.
+        self.assertIn('[ "$n" -eq 0 ] && [ "$QUEUE_AHEAD" != 0 ]', source)
+
     def test_the_driver_owns_its_own_ledger_and_tree(self):
         source = self._submit_source()
         self.assertIn(f"operator_v2e_band_submitted.txt", source)

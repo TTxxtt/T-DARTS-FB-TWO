@@ -38,6 +38,18 @@ OUTARM="${OUTARM:-operator_v2e_band}"
 # GPUFEE06/GPUFEE08 are excluded by request.  Widest partition first.
 PARTITIONS="${PARTITIONS:-GPUFEE04 GPUFEE05 GPUFEE02}"
 DRAIN_SLEEP="${DRAIN_SLEEP:-120}"
+# Queue-ahead: when a partition has no free card right now, contribute this many
+# slots to the pool anyway, so the runs sit PENDING and hold their place instead
+# of losing the freed card to whoever submits first.  Off by default, because on
+# a quiet cluster waiting for a real card is strictly better: a PENDING job is
+# one more thing to track and the free-card count is the honest signal.
+#
+# It is safe because the pool only decides *where* a job is sent -- it has never
+# bounded how many go out.  The QOS submit cap is what bounds queue depth, and
+# queueing can only ever waste a queue slot, never a card: the scheduler will
+# not run more jobs than there are GPUs.  Set it when the partition is
+# contended and the run is short, not as a default.
+QUEUE_AHEAD="${QUEUE_AHEAD:-0}"
 
 LEDGER="$RUNS/sh_log/operator_v2e_band_submitted.txt"
 
@@ -83,6 +95,10 @@ build_pool() {
   for P in $PARTITIONS; do
     n=$(free_cards "$P")
     echo "  $P: $n free card(s)" >&2
+    if [ "$n" -eq 0 ] && [ "$QUEUE_AHEAD" != 0 ]; then
+      echo "    (queue-ahead: contributing $QUEUE_AHEAD slot(s) with no free card)" >&2
+      n="$QUEUE_AHEAD"
+    fi
     for _ in $(seq 1 "$n" 2>/dev/null); do POOL+=("$P"); done
   done
 }
