@@ -157,10 +157,19 @@ Ran 22 tests   OK                     FBNAS/ 下无新增或修改文件
 `tools/analyze_operator_v2.py` 输出：逐 subject×operator 的 mean/std、主效应、交互效应、
 seed/residual 方差，以及比值 `V_subject×operator / V_seed`。
 
-判定规则是硬性的：
+**主分析指标是 `val_best_nll`**（`--metric` 默认值），accuracy 辅助报告 —— validation 只有
+57 个 trial，一个样本就移动 `1.75pp`，在那个粒度上做方差分解量到的是量化误差。
 
-- `V_subject×operator <= V_seed` → 打印 **STOP，不要进入 NAS**
-- `> V_seed` 且不同 subject 的最优 family 确实不同 → 打印 PROCEED
+判定三分支：
+
+- `V_subject×operator > V_seed` 且不同 subject 的最优 family 确实不同 → **PROCEED**
+- `> V_seed` 但所有 subject 的 argmax 同一 family → **PROCEED_WEAK**
+- `V_subject×operator <= V_seed` → **WEAK_GLOBAL**
+
+⚠️ 第三条**不再**打印「STOP，不要进入 NAS」。每个 run 把同一个 family 用在三个频段上，
+任何**频段特异**的偏好会在三个频段之间被平均掉，在这个设计里结构上不可见。所以
+WEAK_GLOBAL 只能支持「没有 family 能**全局**分离」这一条结论，**不能**否定 per-band
+family search。详细的 probe 设计见 `docs/operator_separability_v2.md` 第十节。
 
 - 空目录 → `no runs found`，不崩
 - smoke 数据（1 subject × 1 seed × 5 operators）→ 正确报出"设计不平衡"、列出薄 cell，
@@ -280,8 +289,27 @@ Stage-2 的停止条件是 `val_nll < stage1_terminal_train_nll`，它只是**�
 
 ---
 
-## 四、待决定
+## 四、Tier-1 定位与后续路线
+
+45 个正式任务（003/005/006 × 20250901/02/03 × 5 operators）定义为 **Tier-1
+global-family pilot**：每个 run 把**一个** family 同时用在三个频段上。它回答
+「某种机制全局使用时 subject 是否偏好不同」，**不等价于**「不同 subject 是否在不同
+frequency group 上偏好不同 mechanism」。后者才是 Phase A 的 `(f_L, f_M, f_H)`。
+
+路线：
+
+```
+Tier-1（45 runs，global family）
+  ├─ PROCEED / PROCEED_WEAK  → 有信号，进 Phase A 的 per-band 设计
+  └─ WEAK_GLOBAL             → 只判 global separability weak
+                               下一步跑 band-specific probe，不是放弃 V2
+```
+
+band-specific probe：一次放开一个频段，另两个钉在 anchor。`1 + 3×4 = 13` 个配置 ×
+3 subjects × 3 seeds = **117 runs**。这一维与未来 `5³` 的 per-band family search 完全对齐。
+设计细节见 `docs/operator_separability_v2.md` 第十节。
+
+## 五、待决定
 
 1. ~~`local_attention` 的 2.27× MACs：接受，还是改成更省的变体？~~ → 已返工到 **1.272×**。
-2. 45 个正式任务（003/005/006 × 20250901/02/03 × 5 operators）是否提交？
-3. 修正后的 searched 臂是否作为新基准？旧的 `retrain_lr1e3` 已保留未删。
+2. 修正后的 searched 臂是否作为新基准？旧的 `retrain_lr1e3` 已保留未删。

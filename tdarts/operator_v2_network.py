@@ -18,6 +18,8 @@ searched model rather than approximating it.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 
@@ -26,6 +28,11 @@ from tdarts.backbone import TemporalBackbone
 from tdarts.operator_v2 import V2TemporalOp, build_v2_operator
 
 __all__ = ["OperatorV2Cell", "OperatorV2Net", "V2_STANDALONE_PATH_CHANNELS"]
+
+#: Signature every operator builder shares; a later generation passes its own
+#: through ``builder=`` rather than getting a parallel cell and network, so the
+#: three cells, the band split and the backbone cannot drift between stages.
+OperatorBuilder = Callable[..., V2TemporalOp]
 
 
 #: A standalone cell emits one 12-channel path per band, matching the two
@@ -45,12 +52,13 @@ class OperatorV2Cell(nn.Module):
         target_rf: int,
         in_channels: int = C.IN_CHANNELS,
         out_channels: int = V2_STANDALONE_PATH_CHANNELS,
+        builder: OperatorBuilder = build_v2_operator,
     ) -> None:
         super().__init__()
         self.band = band
         self.op_name = op_name
         self.target_rf = int(target_rf)
-        self.path: V2TemporalOp = build_v2_operator(
+        self.path: V2TemporalOp = builder(
             op_name,
             band=band,
             target_rf=target_rf,
@@ -86,6 +94,7 @@ class OperatorV2Net(nn.Module):
         target_rf: int = 57,
         n_electrodes: int = C.NUM_ELECTRODES,
         n_classes: int = C.NUM_CLASSES,
+        builder: OperatorBuilder = build_v2_operator,
     ) -> None:
         super().__init__()
         self.op_name = op_name
@@ -93,7 +102,7 @@ class OperatorV2Net(nn.Module):
         self.bands = tuple(C.BANDS)
         self.cells = nn.ModuleDict(
             {
-                band: OperatorV2Cell(band, op_name, target_rf=self.target_rf)
+                band: OperatorV2Cell(band, op_name, target_rf=self.target_rf, builder=builder)
                 for band in self.bands
             }
         )

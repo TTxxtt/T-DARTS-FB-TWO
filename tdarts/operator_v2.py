@@ -139,6 +139,12 @@ def count_macs(module: nn.Module, input_shape: tuple[int, ...]) -> int:
         total += int(output.numel() // output.shape[0]) * layer.in_features
 
     was_training = module.training
+    # The probe runs wherever the module lives.  Building it on CPU calls a
+    # CUDA module with a CPU tensor and dies with a dtype/device mismatch --
+    # which is what a GPU training run hits, since the caller measures the cell
+    # after moving the model to the device.  The audit's own CPU-only ops are
+    # unaffected: they have CPU parameters, so this resolves to CPU as before.
+    probe_device = next((p.device for p in module.parameters()), torch.device("cpu"))
     module.eval()
     try:
         for child in module.modules():
@@ -147,7 +153,7 @@ def count_macs(module: nn.Module, input_shape: tuple[int, ...]) -> int:
             elif isinstance(child, nn.Linear):
                 handles.append(child.register_forward_hook(linear_hook))
         with torch.no_grad():
-            module(torch.zeros(input_shape))
+            module(torch.zeros(input_shape, device=probe_device))
     finally:
         for handle in handles:
             handle.remove()
@@ -515,16 +521,25 @@ class V2TemporalOp(nn.Module):
         out_channels: int = C.PATH_CHANNELS * C.NUM_PATHS,
         use_norm: bool = C.USE_CANDIDATE_NORM,
         base_kernel: int | None = None,
+        registry: dict[str, type[_V2OpBase]] | None = None,
     ) -> None:
         super().__init__()
-        if op_name not in V2_OPERATOR_REGISTRY:
+        # A later generation supplies its own registry rather than getting a
+        # parallel wrapper class.  That is deliberate: ``count_macs`` reaches a
+        # family's ``extra_macs`` through ``isinstance(module, V2TemporalOp)``,
+        # and ``temporal_support`` reads the built modules.  A look-alike wrapper
+        # would lose both and under-report the families whose cost sits outside
+        # a convolution.  Defaulting to the V2 registry leaves every existing
+        # call site untouched.
+        registry = V2_OPERATOR_REGISTRY if registry is None else registry
+        if op_name not in registry:
             raise ValueError(
-                f"unknown V2 operator {op_name!r}; expected one of {sorted(V2_OPERATOR_REGISTRY)}"
+                f"unknown V2 operator {op_name!r}; expected one of {sorted(registry)}"
             )
         self.op_name = op_name
         self.band = band
         self.target_rf = int(target_rf)
-        self.op = V2_OPERATOR_REGISTRY[op_name](
+        self.op = registry[op_name](
             band=band,
             target_rf=target_rf,
             in_channels=in_channels,
@@ -566,8 +581,14 @@ def build_v2_operator(
     out_channels: int = C.PATH_CHANNELS * C.NUM_PATHS,
     use_norm: bool = C.USE_CANDIDATE_NORM,
     base_kernel: int | None = None,
+    registry: dict[str, type[_V2OpBase]] | None = None,
 ) -> V2TemporalOp:
-    """Factory mirroring :func:`tdarts.temporal_ops.build_temporal_op`."""
+    """Factory mirroring :func:`tdarts.temporal_ops.build_temporal_op`.
+
+    ``registry`` exists so a later generation can hand in its own family set and
+    still get this wrapper; see :meth:`V2TemporalOp.__init__` for why the
+    wrapper itself is shared rather than copied.
+    """
     return V2TemporalOp(
         op_name=op_name,
         band=band,
@@ -576,6 +597,7 @@ def build_v2_operator(
         out_channels=out_channels,
         use_norm=use_norm,
         base_kernel=base_kernel,
+        registry=registry,
     )
 
 

@@ -154,6 +154,26 @@ class FairnessTests(unittest.TestCase):
                         module.kernel_size[1] * C.NUM_ELECTRODES * 1000
         self.assertGreater(count_macs(op, (1, C.IN_CHANNELS, C.NUM_ELECTRODES, 1000)), 0)
 
+    def test_macs_counter_probes_on_the_modules_own_device(self):
+        """The counter builds a probe tensor; if it builds it on CPU the call
+        fails against a module that lives anywhere else.  A GPU training run
+        measures the cell *after* ``.to(device)``, so the CPU-only form worked
+        in every smoke test and died on the cluster.
+
+        ``meta`` stands in for "not CPU" so this runs everywhere: PyTorch
+        rejects a CPU tensor against a meta module the same way it rejects one
+        against a CUDA module.  The count must also be unchanged -- if the
+        device ever leaked into the arithmetic, the fairness table would shift
+        with the accelerator.
+        """
+        shape = (1, C.IN_CHANNELS, C.NUM_ELECTRODES, 1000)
+        for name in V2_OPERATOR_NAMES:
+            with self.subTest(operator=name):
+                op = build_v2_operator(name, band=BAND, target_rf=RF)
+                on_cpu = count_macs(op, shape)
+                on_meta = count_macs(op.to("meta"), shape)
+                self.assertEqual(on_cpu, on_meta)
+
 
 class GradientTests(unittest.TestCase):
     def test_forward_backward_is_finite_for_every_operator(self):

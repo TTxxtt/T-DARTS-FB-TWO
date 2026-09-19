@@ -163,6 +163,18 @@ FBNAS 完整性单独跑 `tests/test_fbnas_compatibility.py`：22 项 OK，`FBNA
 **valAcc 接近随机是预期的**——只跑 3 epoch、从随机初始化开始，smoke 的目的是验证
 管线能跑通，不是比较性能。
 
+**产物位置**：`run/outputs/operator_v2_smoke/bci42a/`（**不是** `run/outputs/operator_v2/`）。
+
+刻意分开：`train_operator_v2.py` 的 run 目录用 `exist_ok=False` 创建，smoke 若写进正式
+namespace，正式任务会直接 `FileExistsError`；而且分析工具会把 3-epoch 的 smoke 当成一个
+真实 run 读进方差分解，污染 residual。上表由**当前代码**重跑得到（`--epochs 3 --patience 3
+--device cpu`），五个 run 的 operator params / MACs 与返工后的值逐项一致。
+
+⚠️ **历史坑**：返工前留下的那批 smoke 产物（`local_attention` 记的是 504 params /
+26,928,000 MACs / 2.267×）曾被误当成现行证据 —— 那是 attention 返工**之前**的旧代码跑出来的。
+四个未受返工影响的 family 数值恰好相同，所以只看那四个是发现不了的。分析工具现在会对
+这种产物打 `dev 2.27x` 标记。
+
 逐项检查：
 
 - ✅ forward shape 正确
@@ -178,10 +190,30 @@ FBNAS 完整性单独跑 `tests/test_fbnas_compatibility.py`：22 项 OK，`FBNA
 `tools/analyze_operator_v2.py`，输出：逐 subject×operator 的 mean/std、主效应、
 交互效应、seed/residual 方差，以及比值 `V_subject×operator / V_seed`。
 
-判定规则是硬性的：
+**主分析指标是 `val_best_nll`**（`--metric` 的默认值），accuracy 作为辅助指标同时报告。
+理由：validation 只有 57 个 trial，一个样本就对/错就移动 `1/57 ≈ 1.75pp`，在这个粒度上做
+方差分解，量到的一大半是量化误差而不是信号；NLL 连续，且本来就是训练循环的选点依据。
 
-- `V_subject×operator <= V_seed` → 打印 **STOP，不要进入 NAS**
-- `> V_seed` 且不同 subject 的最优 family 确实不同 → 打印 PROCEED
+判定三分支：
+
+- `V_subject×operator > V_seed` 且不同 subject 的最优 family 确实不同 → **PROCEED**
+- `> V_seed` 但所有 subject 的 argmax 是同一个 family → **PROCEED_WEAK**（无法按 subject 特化）
+- `V_subject×operator <= V_seed` → **WEAK_GLOBAL**，见下
+
+### 为什么第三条不再打印「STOP，不要进入 NAS」
+
+原来的措辞把这件事写成了对 NAS 的**终审否决**，这是错的，已删除。
+
+每个 run 把**同一个** family 同时用在 Low/Mid/High 上。于是任何**频段特异**的偏好——
+比如 Low 想要 attention、High 想要别的——会在三个频段之间**被平均掉**，在这个设计里
+**结构上就看不见**。所以 WEAK_GLOBAL 支持的结论只有一条：
+
+> 没有 family 能够**全局**分离。
+
+它**不能**证明 per-band family search 没有价值。原规则把这两件事混为一谈，
+会让一个本可以救回来的方向被一句话判死。
+
+**若 Tier-1 不通过，下一步是 band-specific probe，不是放弃 V2。** 见第十节。
 
 已验证的行为：
 
@@ -213,10 +245,82 @@ RNG 的调用。该约束写在模块 docstring 里，并有测试看着。
 路径现在会给出相同的初始权重。修之前 searched 臂是旧顺序、随机臂是新顺序，
 两臂的 "seed 20250901" 不对应同一组初始权重。）
 
-## 九、未做 / 待确认
+## 九、Tier-1 定位与网格
 
-1. **45 个正式任务未提交**，按约定停在 smoke 之后。
-2. 第一轮网格：`003/005/006 × 20250901/20250902/20250903 × 5 operators = 45`。
-   跑之前需要先决定 namespace（`run/outputs/operator_v2/bci42a/train_s003_seed20250901_operator_v2_dilated/`）。
-3. ~~`local_attention` 的 2.27× MACs 是否接受~~ → 已返工到 **1.272×**，见第三节。
-4. 是否要 `--read-session1`：pilot 阶段**保持关闭**，`val_best_acc` 作为唯一指标。
+这一轮 45 个任务定义为 **Tier-1 global-family pilot**：每个 run 把**一个** family 同时用于
+三个频段，回答的是「某一种机制全局使用时，subject 是否表现出不同偏好」。
+
+网格：
+
+```
+subjects 003 / 005 / 006  ×  seeds 20250901 / 20250902 / 20250903  ×  5 operators  =  45
+```
+
+namespace：`run/outputs/operator_v2/bci42a/train_s003_seed20250901_operator_v2_dilated/`。
+
+`--read-session1` 保持**关闭**，`val_best_nll` 为唯一选点指标（accuracy 辅助报告）。
+
+## 十、后续：band-specific probe（Tier-1 不通过时）
+
+Tier-1 说的是「一个 family 打满三个频段」。真正要做的是 per-band 选择，即
+`(f_L, f_M, f_H)` 三个位置各自挑 family，共 `5³ = 125` 种组合。这两件事不等价，
+所以要有一个能看见**频段特异**信号的中间实验。
+
+设计：**一次只放开一个频段**，另外两个钉在 anchor 上。
+
+```
+Baseline:   Low=dilated, Mid=dilated, High=dilated
+
+Low probe:  Low ∈ {gated, local_attention, dynamic, band_gated}
+            Mid=dilated, High=dilated
+
+Mid probe:  Low=dilated
+            Mid ∈ {gated, local_attention, dynamic, band_gated}
+            High=dilated
+
+High probe: Low=dilated, Mid=dilated
+            High ∈ {gated, local_attention, dynamic, band_gated}
+```
+
+配置数不是 `3×4 = 12` 而是 `1 + 3×4 = 13`——baseline 三条 probe 共用一条，只跑一次。
+
+$$
+13\ \text{configs} \times 3\ \text{subjects} \times 3\ \text{seeds} = 117\ \text{runs}
+$$
+
+这 117 个 run 的每一维都与未来 `5³` 的 per-band family search 对齐：probe 测的就是
+搜索要利用的那一维。判据仍然是 `V_subject×operator / V_seed`，但现在是**逐频段**算的。
+
+**触发条件**：Tier-1 打印 `WEAK_GLOBAL`。此时只能判定 global family separability weak，
+**不得**据此否定 per-band family search。
+
+## 十一、未做 / 待确认
+
+1. `local_attention` 的 2.27× MACs → 已返工到 **1.272×**，见第三节。
+2. `--read-session1`：pilot 阶段**保持关闭**。
+3. Tier-1 若通过（PROCEED / PROCEED_WEAK）→ 直接进 Phase A 的 per-band 设计；
+   若 WEAK_GLOBAL → 按第十节跑 117 个 band-specific probe，**不放弃 V2**。
+
+## 十二、结果已冻结：本世代改称 Matched-V2
+
+45 个 run 已跑完并冻结在 `run/outputs/operator_v2/`，**不再修改、不覆盖**。
+
+**判定：`WEAK_GLOBAL`（raw `val_best_nll` 尺度，ratio 0.833）。** 该读数维持原样。
+
+```
+V_operator / V_seed          = 4.754     机制确实拉开了
+V_subject×operator / V_seed  = 0.833     但没有按受试者特化
+```
+
+9/9 个 subject×seed 的排序完全一致（top-2 恒为 `{dilated, dynamic}`，
+bottom-2 恒为 `{local_attention, band_gated}`），三个受试者的 argmax 全部跨 seed 翻转。
+
+**关键推论：这一批说明的是「有明显机制差异，但精简版 operator 的优劣是全局性的」，
+不等于「新 operator 没区别」。** 因此它**不构成**对 per-band family search 的否定。
+
+⚠️ **两代尺度不同。** 本世代的记录用 **raw** `val_best_nll`；第二世代
+（Expressive-V2，放开了参数匹配）预注册 **`log(val_best_nll)`**。同一份数据 raw 下
+ratio 0.833、log 下 1.187 —— 结论跨过阈值，这正是判据从「单一 `>1` 开关」改掉的直接原因。
+两代的方差分量**不可数值比较**。
+
+第二世代见 **`docs/operator_separability_v2e.md`**。

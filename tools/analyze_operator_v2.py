@@ -45,20 +45,34 @@ substitute).  Negative estimates are clamped at 0 -- the clamp is reported
 whenever it fires, because a clamped component means "no detectable effect",
 not "a small negative one".
 
-Decision rule
--------------
-    V_subject x operator <= V_seed  -> STOP: the family preference does not
-        exceed seed noise, so a per-subject architecture search has nothing to
-        find.
+Decision rule (Tier-1 global pilot)
+-----------------------------------
     V_subject x operator >  V_seed  -> PROCEED, but only if the second
         condition also holds: the best family differs across subjects (>= 2
         distinct per-subject argmax winners).  A large interaction driven by
         two subjects swapping places is still an interaction, but a single
         winner means there is nothing to specialise.
+    V_subject x operator <= V_seed  -> WEAK_GLOBAL: no family preference
+        survives seed noise *when one family serves all three bands at once*.
 
-``test`` is null in every pilot run on purpose (Session 1 is never opened);
-the primary metric is therefore ``val_best_acc`` (``val_best_nll``, lower is
-better, is also accepted).
+The second outcome is **not** a verdict on the NAS idea, and the tool refuses
+to word it as one.  Each run in this pilot varies a single family across Low,
+Mid and High simultaneously, so a preference that is band-specific -- low
+wants attention, high wants something else -- cancels out across the three
+bands and cannot appear here.  WEAK_GLOBAL therefore bounds *global* family
+separability only.  The next experiment is a band-specific probe (vary one
+band, pin the other two to the anchor), not abandoning the per-band search;
+see ``docs/operator_separability_v2.md``.
+
+Metric
+------
+``test`` is null in every pilot run on purpose (Session 1 is never opened).
+The **primary metric is ``val_best_nll``**.  The validation split holds 57
+trials, so a single trial moves accuracy by ~1/57 = 1.75pp and a variance
+decomposition over that granularity measures quantisation as much as signal.
+NLL is continuous and is what the training loop already selects on, so it is
+the metric the decomposition runs on; ``val_best_acc`` is accepted and
+reported alongside as the secondary, human-readable number.
 """
 
 from __future__ import annotations
@@ -79,11 +93,19 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from run_layout import subject_id  # noqa: E402
+from tools.operator_anova import (  # noqa: E402
+    _effect_coding,
+    _fmt_ratio,
+    _sse,
+    generation_mix,
+    print_anova,
+    refuse_mixed_generations,
+    two_way_anova,
+    variance_ratio,
+)
 
-try:  # scipy is only used to decorate F statistics with a p-value
-    from scipy import stats as _scipy_stats
-except Exception:  # pragma: no cover - exercised on machines without scipy
-    _scipy_stats = None
+# Re-exported from the shared module so the rest of this file is unchanged.
+from tools.operator_anova import _scipy_stats, np  # noqa: E402, F401
 
 #: Canonical operator set of the pilot; ``dilated`` is the FBNAS anchor.
 OPERATORS = ("dilated", "gated", "local_attention", "dynamic", "band_gated")
@@ -97,7 +119,11 @@ METRIC_DIRECTION = {
 
 #: Parameter fairness band vs the anchor (mirrors tdarts.operator_v2.PARAM_TOLERANCE).
 PARAM_TOLERANCE = 0.20
-#: MACs are *not* matched across operators; attention is expected to be far off.
+#: Ratio of the anchor's MACs outside which a family is flagged.  All five
+#: families are matched by construction -- the widest is attention at 1.272x --
+#: so this is a regression detector, not a budget check: it fires if a family
+#: drifts far enough that a score difference could be read as "more arithmetic"
+#: rather than "better mechanism".
 MAC_FLAG_RATIO = 1.5
 
 LEAF_RE = re.compile(r"^train_s(?P<subject>[^_]+)_seed(?P<seed>[^_]+?)(?:_(?P<arm>.+))?$")
@@ -116,11 +142,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="bci42a")
     parser.add_argument(
         "--metric",
-        default="val_best_acc",
+        default="val_best_nll",
         choices=sorted(METRIC_DIRECTION),
-        help="metric to decompose (default: val_best_acc)",
+        help="metric to decompose (default: val_best_nll -- accuracy is "
+        "quantised to 1/57 on the validation split and is reported alongside "
+        "as the secondary metric)",
     )
     parser.add_argument("--json", type=Path, default=None, help="dump the full analysis here")
+    parser.add_argument(
+        "--combine-generations",
+        action="store_true",
+        help="allow runs from more than one operator generation in one "
+        "decomposition.  OFF by default and deliberately awkward: the two "
+        "generations are recorded on different metric scales, so a pooled "
+        "number is comparable to neither.  This tool's default root holds only "
+        "the Matched generation, so the guard never fires unless a root is "
+        "pointed somewhere it should not be.",
+    )
     parser.add_argument(
         "--min-runs-per-cell",
         type=int,
@@ -217,198 +255,6 @@ def discover_runs(roots: list[Path], dataset: str) -> tuple[list[dict[str, Any]]
                 }
             )
     return runs, warnings
-
-
-def _effect_coding(labels: list[int], n_levels: int) -> np.ndarray:
-    """Effect coding: +1 on the level, -1 on the reference (last) level."""
-
-    index = np.asarray(labels)
-    columns = [(index == level).astype(float) - (index == n_levels - 1).astype(float) for level in range(n_levels - 1)]
-    if not columns:
-        return np.zeros((len(labels), 0))
-    return np.column_stack(columns)
-
-
-def _sse(design: np.ndarray, y: np.ndarray) -> float:
-    """Residual sum of squares of ``y ~ design`` (intercept added by the caller)."""
-
-    matrix = np.column_stack([np.ones(len(y)), design]) if design.shape[1] else np.ones((len(y), 1))
-    beta, *_ = np.linalg.lstsq(matrix, y, rcond=None)
-    residual = y - matrix @ beta
-    return float(residual @ residual)
-
-
-def two_way_anova(rows: list[dict[str, Any]], metric: str) -> dict[str, Any] | None:
-    """Type III two-way ANOVA with interaction, plus EMS variance components.
-
-    Returns ``None`` when the design has no replication (df_residual == 0), since
-    then SS_residual is identically zero and the seed-variance scale -- the whole
-    yardstick of the decision rule -- does not exist.
-    """
-
-    subjects = sorted({row["subject"] for row in rows})
-    operators = sorted({row["operator"] for row in rows})
-    n_subjects, n_operators = len(subjects), len(operators)
-    if n_subjects < 2 or n_operators < 2:
-        print(
-            f"!! ANOVA needs >= 2 subjects and >= 2 operators, found "
-            f"{n_subjects} subjects x {n_operators} operators",
-            file=sys.stderr,
-        )
-        return None
-
-    subject_of = {name: index for index, name in enumerate(subjects)}
-    operator_of = {name: index for index, name in enumerate(operators)}
-    subj_idx = [subject_of[row["subject"]] for row in rows]
-    op_idx = [operator_of[row["operator"]] for row in rows]
-
-    s_code = _effect_coding(subj_idx, n_subjects)
-    o_code = _effect_coding(op_idx, n_operators)
-    interaction = np.column_stack([s_code[:, a] * o_code[:, b] for a in range(s_code.shape[1]) for b in range(o_code.shape[1])])
-    y = np.asarray([row[metric] for row in rows], dtype=float)
-
-    sse_full = _sse(np.column_stack([s_code, o_code, interaction]), y)
-    sse_no_interaction = _sse(np.column_stack([s_code, o_code]), y)
-    sse_no_operator = _sse(np.column_stack([s_code, interaction]), y)
-    sse_no_subject = _sse(np.column_stack([o_code, interaction]), y)
-    sse_null = _sse(np.zeros((len(y), 0)), y)
-
-    ss_subject = sse_no_subject - sse_full
-    ss_operator = sse_no_operator - sse_full
-    ss_interaction = sse_no_interaction - sse_full
-    ss_residual = sse_full
-    ss_total = sse_null
-
-    df_subject = n_subjects - 1
-    df_operator = n_operators - 1
-    df_interaction = df_subject * df_operator
-    df_residual = len(rows) - n_subjects * n_operators
-    if df_residual <= 0:
-        print(
-            f"!! no residual degrees of freedom ({len(rows)} runs for "
-            f"{n_subjects}x{n_operators} cells): every cell has exactly one seed, "
-            "so seed variance is not estimable -- add seeds",
-            file=sys.stderr,
-        )
-        return None
-
-    ms = {
-        "subject": ss_subject / df_subject,
-        "operator": ss_operator / df_operator,
-        "interaction": ss_interaction / df_interaction,
-        "residual": ss_residual / df_residual,
-    }
-
-    # Harmonic mean of the per-cell counts: the standard unbalanced stand-in for
-    # the balanced n_rep in the EMS formulas.  With a balanced grid it is exactly
-    # the seed count per cell.
-    counts = [sum(1 for row in rows if row["subject"] == s and row["operator"] == o) for s in subjects for o in operators]
-    filled = [count for count in counts if count > 0]
-    n_rep = len(filled) / sum(1.0 / count for count in filled)
-    balanced = len(set(filled)) == 1
-
-    raw = {
-        "interaction": (ms["interaction"] - ms["residual"]) / n_rep,
-        "operator": (ms["operator"] - ms["interaction"]) / (n_subjects * n_rep),
-        "subject": (ms["subject"] - ms["interaction"]) / (n_operators * n_rep),
-        "seed": ms["residual"],
-    }
-    components = {key: max(0.0, value) for key, value in raw.items()}
-    clamped = [key for key, value in raw.items() if value < 0]
-
-    f_stats = {
-        "interaction": ms["interaction"] / ms["residual"],
-        "operator": ms["operator"] / ms["interaction"] if ms["interaction"] > 0 else float("inf"),
-        "subject": ms["subject"] / ms["interaction"] if ms["interaction"] > 0 else float("inf"),
-    }
-    p_values = {}
-    if _scipy_stats is not None:
-        p_values = {
-            "interaction": float(_scipy_stats.f.sf(f_stats["interaction"], df_interaction, df_residual)),
-            "operator": float(_scipy_stats.f.sf(f_stats["operator"], df_operator, df_interaction)),
-            "subject": float(_scipy_stats.f.sf(f_stats["subject"], df_subject, df_interaction)),
-        }
-
-    return {
-        "subjects": subjects,
-        "operators": operators,
-        "n_runs": len(rows),
-        "n_rep": n_rep,
-        "balanced": balanced,
-        "cell_counts": {
-            f"{subject}/{operator}": sum(1 for row in rows if row["subject"] == subject and row["operator"] == operator)
-            for subject in subjects
-            for operator in operators
-        },
-        "ss": {
-            "subject": ss_subject,
-            "operator": ss_operator,
-            "interaction": ss_interaction,
-            "residual": ss_residual,
-            "total": ss_total,
-        },
-        "df": {
-            "subject": df_subject,
-            "operator": df_operator,
-            "interaction": df_interaction,
-            "residual": df_residual,
-        },
-        "ms": ms,
-        "f": f_stats,
-        "p": p_values,
-        "components_raw": raw,
-        "components": components,
-        "clamped": clamped,
-        "scipy": _scipy_stats is not None,
-    }
-
-
-def variance_ratio(component: float, seed: float) -> float:
-    """Ratio to the seed component; ``inf`` when seed noise is exactly zero."""
-
-    return float("inf") if seed <= 0 else component / seed
-
-
-def _fmt_ratio(value: float) -> str:
-    return "inf (V_seed = 0)" if math.isinf(value) else f"{value:.3f}"
-
-
-def print_anova(anova: dict[str, Any]) -> None:
-    print("\ntwo-way ANOVA with interaction (Type III SS, EMS variance components)")
-    if anova["balanced"]:
-        print(f"balanced grid, n_rep = {anova['n_rep']:.0f} seeds per cell")
-    else:
-        print(
-            f"UNBALANCED grid -- EMS components use the harmonic-mean n_rep = {anova['n_rep']:.2f} "
-            "and are approximate; fix the missing cells before trusting the ratios"
-        )
-    header = f"{'source':<14}{'SS':>12}{'df':>5}{'MS':>12}{'V(component)':>14}{'F':>10}"
-    if anova["scipy"]:
-        header += f"{'p':>12}"
-    print(header)
-    print("-" * len(header))
-    for key, label in (
-        ("subject", "subject"),
-        ("operator", "operator"),
-        ("interaction", "subj x op"),
-        ("residual", "seed (resid)"),
-    ):
-        line = (
-            f"{label:<14}{anova['ss'][key]:>12.6f}{anova['df'][key]:>5}{anova['ms'][key]:>12.6f}"
-            f"{anova['components'][key]:>14.6f}"
-        )
-        f_value = anova["f"].get(key)
-        line += f"{'  --':>10}" if f_value is None else f"{f_value:>10.3f}"
-        if anova["scipy"]:
-            p_value = anova["p"].get(key)
-            line += f"{'  --':>12}" if p_value is None else f"{p_value:>12.4g}"
-        suffix = "   <- clamped at 0" if key in anova["clamped"] else ""
-        print(line + suffix)
-    print(f"{'total':<14}{anova['ss']['total']:>12.6f}{sum(anova['df'].values()):>5}")
-    for key in anova["clamped"]:
-        print(f"note: V_{key} estimate was negative and is clamped to 0 (effect not detectable at this seed budget)")
-    if not anova["scipy"]:
-        print("note: scipy not importable -- F p-values omitted, SS/MS/components unaffected")
 
 
 def print_cells(rows: list[dict[str, Any]], subjects: list[str], operators: list[str], metric: str) -> dict[str, Any]:
@@ -526,11 +372,11 @@ def print_fairness(rows: list[dict[str, Any]], operators: list[str]) -> dict[str
         param_flag = ""
         if param_ratio is not None:
             param_flag = "" if abs(param_ratio - 1.0) <= PARAM_TOLERANCE else f"OUT +/-{PARAM_TOLERANCE:.0%}"
-        # MACs are not matched by design: attention is expected around 2.3x.  This
-        # is a surfaced, known deviation, not an error.
         mac_flag = ""
         if mac_ratio is not None:
-            mac_flag = "" if abs(mac_ratio - 1.0) <= 0.5 else f"dev {mac_ratio:.2f}x"
+            mac_flag = (
+                "" if abs(mac_ratio - 1.0) <= MAC_FLAG_RATIO - 1.0 else f"dev {mac_ratio:.2f}x"
+            )
         fairness[operator] = {
             "operator_params": params,
             "operator_macs": macs,
@@ -549,7 +395,10 @@ def print_fairness(rows: list[dict[str, Any]], operators: list[str]) -> dict[str
         print(f"!! anchor '{ANCHOR}' has no runs -- fairness ratios are not interpretable")
     else:
         print(f"param flag = outside +/-{PARAM_TOLERANCE:.0%} of the anchor's parameters (fairness violation)")
-        print("macFlag is informational only: MACs are expected to diverge (attention ~2.3x), not an error")
+        print(
+            f"macFlag fires outside {MAC_FLAG_RATIO:.2f}x the anchor's MACs; all five families are matched "
+            "by construction, so a flag means a regression rather than a known deviation"
+        )
     return fairness
 
 
@@ -580,6 +429,17 @@ def main() -> int:
         return 1
 
     print(f"found {len(runs)} run(s)")
+
+    # Generation separation.  This is inert on the default root -- every run
+    # under run/outputs/operator_v2 is Matched -- so it cannot change the
+    # recorded reading.  It exists to catch the one thing that would: an
+    # Expressive run that landed in this tree, which the directory walk below
+    # would otherwise fold into the archived ANOVA as an unknown operator.
+    mix = generation_mix(runs)
+    if len(mix) > 1:
+        print(f"\ngenerations present: {mix}")
+    if not refuse_mixed_generations(runs, combine=args.combine_generations):
+        return 2
 
     # The pilot is only valid while Session 1 stays closed; a run that opened it
     # has a test number the rest of the grid cannot be compared against.
@@ -631,13 +491,20 @@ def main() -> int:
         distinct_winners = sorted({entry["winner"] for entry in per_subject.values()})
         print("\nverdict")
         if components["interaction"] <= components["seed"]:
-            verdict = "STOP"
+            verdict = "WEAK_GLOBAL"
             print(
-                "  STOP -- do not proceed to NAS. V_subject x operator "
-                f"({components['interaction']:.6f}) does not exceed V_seed ({components['seed']:.6f}): "
-                "the operator family preference is within seed noise, so a per-subject architecture "
-                "search has nothing subject-specific to find. More seeds will not rescue a zero interaction; "
-                "a stronger interaction would need a stronger operator family or a harder dataset."
+                "  WEAK_GLOBAL -- global family separability is weak. V_subject x operator "
+                f"({components['interaction']:.6f}) does not exceed V_seed ({components['seed']:.6f}) when one "
+                "family serves all three bands at once. More seeds will not rescue a zero interaction."
+            )
+            print(
+                "  This is NOT a verdict on the NAS idea, and it does not falsify a per-band family search. "
+                "A preference that is band-specific -- low band wanting attention while the high band wants "
+                "something else -- averages out across the three bands and is invisible to this design by "
+                "construction. The claim that is supported here is only: no family separates globally. "
+                "Next step is the band-specific probe (vary one band, pin the other two to the anchor), "
+                "which is what a per-band 5^3 family search actually has to beat; see "
+                "docs/operator_separability_v2.md."
             )
         elif len(distinct_winners) < 2:
             verdict = "PROCEED_WEAK"
