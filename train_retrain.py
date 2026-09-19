@@ -30,6 +30,13 @@ import torch.nn as nn
 from torch.utils.data import ConcatDataset, DataLoader
 
 from tdarts.anchored import ANCHORED_SCHEME, load_anchored_genotype
+from tdarts.band_discrete import (
+    BAND_SCHEME,
+    BandDiscreteNet,
+    band_duplicate_bands,
+    band_structure_keys,
+    load_band_genotype,
+)
 from tdarts.discrete_network import TemporalDiscreteNet, transfer_supernet_weights
 from run_layout import allocate
 from tdarts.genotype import (
@@ -339,10 +346,21 @@ def main() -> int:
         if not summary_path.is_file() or not best_path.is_file():
             raise FileNotFoundError(f"--stage2-only: {run_dir} missing final_summary.json or best.pt")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        saved = summary.get("genotype")
+        if isinstance(saved, dict) and saved.get("scheme") == BAND_SCHEME:
+            # This branch rebuilds the model through load_genotype, which reads
+            # the plain six-gene grammar.  The band dialect would be silently
+            # rejected there rather than resumed, and a half-resumed run is
+            # worse than a refusal: say so instead of letting it fail obscurely.
+            raise ValueError(
+                "--stage2-only cannot resume a band-dialect run: it reconstructs the "
+                "genotype with load_genotype, which reads the plain six-gene grammar. "
+                "Re-run the arm's own Stage 1 command; it runs both stages in one process."
+            )
         # Reconstruct genotype from the saved summary.  final_summary.json stores
         # Genotype.to_dict() inline, so hand the dict to load_genotype directly
         # (passing it as a path would TypeError).
-        genotype = load_genotype(summary["genotype"])
+        genotype = load_genotype(saved)
         genotype_source = summary.get("genotype_source", {"kind": "final_summary"})
         stage1 = summary.get("stage1", {})
         # Two Stage-2 stopping thresholds, both recorded and read out on Session
@@ -501,15 +519,22 @@ def main() -> int:
     # would make the corrected command fail on its second attempt.
     checkpoint_path: Path | None = None
     genotype_source: dict = {}
+    band_genotype = None
     if args.genotype_json is not None:
-        # One flag, two file dialects: the anchored export carries a scheme tag
-        # and stricter validation, every other producer writes the plain
+        # One flag, three file dialects.  The anchored export carries a scheme
+        # tag and stricter validation; the band export carries a different
+        # grammar altogether (a family per band plus one or two RFs, rather than
+        # one candidate per path); every other producer writes the plain
         # six-gene file.  Dispatch on the tag rather than on the caller, so a
-        # plain file can never be misread as anchored (or vice versa).
+        # plain file can never be misread as either tagged dialect.
         payload = json.loads(args.genotype_json.read_text(encoding="utf-8"))
         if payload.get("scheme") == ANCHORED_SCHEME:
             genotype = load_anchored_genotype(args.genotype_json)
             genotype_source = {"kind": "anchored_genotype_json", "path": str(args.genotype_json)}
+        elif payload.get("scheme") == BAND_SCHEME:
+            band_genotype = load_band_genotype(args.genotype_json)
+            genotype = None
+            genotype_source = {"kind": "band_genotype_json", "path": str(args.genotype_json)}
         else:
             genotype = load_genotype(args.genotype_json)
             genotype_source = {"kind": "genotype_json", "path": str(args.genotype_json)}
@@ -532,9 +557,18 @@ def main() -> int:
             "epoch": search_epochs,
         }
     # structure_keys is recorded either way: it is the evidence that the flag's
-    # verdict came from built operators rather than from string equality.
-    structure_keys = path_structure_keys(genotype)
-    duplicate_bands = duplicate_structure_bands(genotype)
+    # verdict came from built operators rather than from string equality.  The
+    # band dialect owns its own reader because its candidates are (family, RF)
+    # pairs, not 14-registry candidate strings, and because the V2/E families
+    # carry support rather than structure_key.
+    if band_genotype is not None:
+        structure_keys = band_structure_keys(band_genotype)
+        duplicate_bands = band_duplicate_bands(band_genotype)
+        genotype_payload = band_genotype.to_dict()
+    else:
+        structure_keys = path_structure_keys(genotype)
+        duplicate_bands = duplicate_structure_bands(genotype)
+        genotype_payload = genotype.to_dict()
     if args.no_duplicate_paths and duplicate_bands:
         details = "; ".join(
             f"{band}: {structure_keys[band][0]} == {structure_keys[band][1]}"
@@ -561,7 +595,9 @@ def main() -> int:
     # seed-matching every architecture comparison here rests on -- measured on
     # s009 at epoch 1: 2.78 vs 2.19 train NLL, from the seed alone.
     set_seed(args.seed)
-    model = TemporalDiscreteNet(genotype).to(device)
+    model = (
+        BandDiscreteNet(band_genotype) if band_genotype is not None else TemporalDiscreteNet(genotype)
+    ).to(device)
     transferred = []
     if args.initialization == "transfer":
         if not checkpoint_path.is_file():
@@ -607,9 +643,9 @@ def main() -> int:
     macs = count_macs(model, device)
     config = {
         "args": serialise_args(args),
-        "genotype": genotype.to_dict(),
+        "genotype": genotype_payload,
         "genotype_source": genotype_source,
-        "path_structure_keys": {band: [list(first), list(second)] for band, (first, second) in structure_keys.items()},
+        "path_structure_keys": {band: [list(key) for key in keys] for band, keys in structure_keys.items()},
         "duplicate_structure_bands": list(duplicate_bands),
         "session0_train_size": split.train_size,
         "session0_val_size": split.val_size,
@@ -789,9 +825,9 @@ def main() -> int:
         torch.save({"stage2_epoch": stage2_epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict()}, args.output_dir / "stage2_final.pt")
         test = evaluate(model, test_loader, criterion, device, confusion=True)
     summary = {
-        "initialization": args.initialization, "genotype": genotype.to_dict(),
+        "initialization": args.initialization, "genotype": genotype_payload,
         "genotype_source": genotype_source,
-        "path_structure_keys": {band: [list(first), list(second)] for band, (first, second) in structure_keys.items()},
+        "path_structure_keys": {band: [list(key) for key in keys] for band, keys in structure_keys.items()},
         "duplicate_structure_bands": list(duplicate_bands),
         "parameters": parameters, "macs": macs,
         "stage1": {"best_epoch": best_epoch, "stop_epoch": stage1_stop_epoch,
