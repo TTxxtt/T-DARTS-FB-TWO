@@ -693,6 +693,67 @@ class Stage2ProtocolParityTests(unittest.TestCase):
         return module
 
 
+class ComparisonToolTests(unittest.TestCase):
+    """The two arms' producers do not agree on every metric's name.
+
+    Upstream's ``results.csv`` writes macro-F1 as ``f1``; ``train_retrain.py``
+    writes ``macro_f1``.  A comparison tool that assumed one name would crash on
+    the other producer's data -- which is exactly what happened the first time
+    it was pointed at real Arm B output, so it is pinned here.
+    """
+
+    def _tool(self):
+        spec = importlib.util.spec_from_file_location(
+            "compare_session2_arms_under_test", PROJECT_ROOT / "tools/compare_session2_arms.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_metric_mapping_names_both_producers_keys(self):
+        tool = self._tool()
+        mapping = {label: (a, b) for label, a, b in tool.METRICS}
+        self.assertEqual(mapping["acc"], ("acc", "acc"))
+        self.assertEqual(mapping["kappa"], ("kappa", "kappa"))
+        self.assertEqual(mapping["f1"], ("f1", "macro_f1"))
+        self.assertEqual(tool.LABELS, ("acc", "f1", "kappa"))
+
+    def test_arm_b_is_read_through_its_own_key_names(self):
+        import tempfile
+
+        tool = self._tool()
+        with tempfile.TemporaryDirectory() as tmp:
+            leaf = Path(tmp) / "bci42a" / "train_s003_seed20190821_armB"
+            leaf.mkdir(parents=True)
+            (leaf / "final_summary.json").write_text(
+                json.dumps({
+                    "test": {"acc": 0.8, "kappa": 0.7, "macro_f1": 0.75, "nll": 0.5},
+                    "parameters": 123, "macs": 456, "screening_only": False,
+                }),
+                encoding="utf-8",
+            )
+            row = tool.load_arm_b(Path(tmp) / "bci42a", "armB", "003", "20190821")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["test"], {"acc": 0.8, "f1": 0.75, "kappa": 0.7})
+        self.assertAlmostEqual(row["nll"], 0.5)
+
+    def test_a_run_that_never_opened_session_two_is_not_a_result(self):
+        """``--screening-only`` writes ``test: null``; that must read as absent
+        rather than as a zero."""
+
+        import tempfile
+
+        tool = self._tool()
+        with tempfile.TemporaryDirectory() as tmp:
+            leaf = Path(tmp) / "bci42a" / "train_s003_seed20190821_armB"
+            leaf.mkdir(parents=True)
+            (leaf / "final_summary.json").write_text(
+                json.dumps({"test": None, "parameters": 1, "macs": 1}), encoding="utf-8"
+            )
+            self.assertIsNone(tool.load_arm_b(Path(tmp) / "bci42a", "armB", "003", "20190821"))
+
+
 class EntryPointTests(unittest.TestCase):
     def _import(self):
         spec = importlib.util.spec_from_file_location(

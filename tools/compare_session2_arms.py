@@ -34,7 +34,16 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-METRICS = ("acc", "f1", "kappa")
+#: ``(label, Arm A key, Arm B key)``.  The two producers disagree on one name:
+#: upstream's ``results.csv`` calls macro-F1 ``f1``, ``train_retrain.py`` calls
+#: it ``macro_f1``.  Same quantity, so the mapping is explicit rather than a
+#: rename that would silently drop a column.
+METRICS = (
+    ("acc", "acc", "acc"),
+    ("f1", "f1", "macro_f1"),
+    ("kappa", "kappa", "kappa"),
+)
+LABELS = tuple(label for label, _, _ in METRICS)
 
 #: Arm A's Session-2 evaluation lives in the `test` row of results.csv.
 ARM_A_DEFAULT = PROJECT_ROOT / "run/outputs/operator_armB_comparison/arm_a_session2.json"
@@ -72,7 +81,7 @@ def load_arm_b(root: Path, arm: str, subject: str, seed: str) -> dict | None:
         return None
     return {
         "leaf": leaf,
-        "test": {m: float(test[m]) for m in METRICS},
+        "test": {label: float(test[b_key]) for label, _, b_key in METRICS},
         "nll": float(test.get("nll", float("nan"))),
         "genotype": payload.get("genotype"),
         "parameters": payload.get("parameters"),
@@ -109,14 +118,17 @@ def main() -> int:
             {
                 "subject": subject,
                 "seed": args.seed,
-                "arm_a": {m: float(a_test[m]) for m in METRICS},
+                "arm_a": {label: float(a_test[a_key]) for label, a_key, _ in METRICS},
                 "arm_a_rf_values": arm_a["subjects"][subject]["rf_values"],
                 "arm_b": b["test"],
                 "arm_b_nll": b["nll"],
                 "arm_b_genotype": b["genotype"],
                 "arm_b_parameters": b["parameters"],
                 "arm_b_macs": b["macs"],
-                "delta": {m: b["test"][m] - float(a_test[m]) for m in METRICS},
+                "delta": {
+                    label: b["test"][label] - float(a_test[a_key])
+                    for label, a_key, _ in METRICS
+                },
                 "delta_nll": b["nll"] - float(a_test["loss"]),
             }
         )
@@ -144,7 +156,7 @@ def main() -> int:
     print()
     print(f"{'metric':<8}{'Arm A mean':>13}{'Arm A sd':>11}{'Arm B mean':>13}{'Arm B sd':>11}"
           f"{'mean delta':>13}{'sd':>9}{'B wins':>9}")
-    for metric in METRICS:
+    for metric in LABELS:
         a_values = [row["arm_a"][metric] for row in rows]
         b_values = [row["arm_b"][metric] for row in rows]
         deltas = [row["delta"][metric] for row in rows]
