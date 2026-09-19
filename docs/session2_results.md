@@ -121,3 +121,54 @@ here in full. The two that bear on this result:
 The substitution correlation in the section above is exploratory. It would need
 its own pre-registered design — more subjects, and a controlled family
 assignment rather than one read off the search — before it could carry weight.
+
+---
+
+# Frozen outcome (2026-09-19)
+
+Per the review decision, this line is **closed**. The conclusion is frozen as:
+
+> **扩大 temporal mechanism 搜索空间，在当前协议下反而降低跨-session 泛化。**
+
+Expanding the temporal-mechanism search space, under the current protocol,
+*reduces* cross-session generalisation.
+
+## Why it is frozen rather than investigated further
+
+An implementation audit was run before freezing, because a negative result from
+buggy code is not a negative result. It found no defect:
+
+| check | result |
+|---|---|
+| Does the searched architecture execute identically in the search stage and the retrain stage? | **max abs difference = 0.0** (weights transplanted, outputs compared element-wise) |
+| Stage-2 rule, split, batch size, selection variable, seed vs. Arm A's own archived `config.csv` | matched, pinned by `Stage2ProtocolParityTests` |
+| `genotype.json` vs `final_summary.json` vs `phase_a_result.json` (families and RFs) | self-consistent on every subject checked |
+| `set_seed` placement relative to both model constructions | immediately before, both phases |
+| params / MACs | Arm A 26284 / 40.0M; Arm B 18292–20396 / 45.2–91.9M |
+
+**Arm B is not to be tuned against Session 2.** Adjusting it now, having seen
+these numbers, would be test-set tuning, and the comparison would stop meaning
+anything. The negative result stands as recorded.
+
+## What is *not* claimed
+
+The frozen claim is scoped to *this protocol and these arms*. It is not the
+claim that temporal-mechanism search is useless in general, and it is not a
+verdict on the operators themselves: Arm B differs from Arm A in its search
+space, its search implementation and its network implementation at once, so the
+3.2-point gap cannot be attributed to any one of them. What the audit
+establishes is only that the gap is not an execution defect.
+
+The one thing that did point at the operators — more substituted bands tracking
+worse transfer (`corr = -0.658`) — is post hoc, is confounded with the same
+three-way difference, and rests on two subjects in its worst group. It is
+recorded as a hypothesis, not a finding.
+
+## Methodological note carried forward
+
+The dataset's second session has now been read and its results are known. **Any
+frequency-frontend method designed in response to this cannot claim a
+never-seen test on BCIC-IV-2a Session 2.** Development for the next stage stays
+locked to Session 1; final reporting on 2a Session 2 is a retrospective
+comparison, and an independent cross-session dataset (e.g. OpenBMI) is needed
+for genuine external confirmation.
